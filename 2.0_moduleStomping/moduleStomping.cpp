@@ -23,6 +23,7 @@ int main(int argc, char* argv[]) {
         if (!hModule) { PrintError("Fallback LoadLibrary also failed"); free(payload); return 1; }
         printf("[+] Loaded fallback DLL\n");
     }
+    DisableThreadLibraryCalls(hModule);
     wprintf(L"[+] %s loaded at: 0x%p\n", STOMP_DLL_PATH, hModule);
 
     PrintStep(3, "Verifying injection");

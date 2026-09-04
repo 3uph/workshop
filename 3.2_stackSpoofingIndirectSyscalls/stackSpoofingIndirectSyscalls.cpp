@@ -43,5 +43,6 @@ int main(int argc, char* argv[]) {
     printf("[+] Executing payload in main thread at: %p\n", execMem);
     ((void(*)())execMem)();
 
+    WaitForSingleObject(GetCurrentThread(), INFINITE);
     return 0;
 }

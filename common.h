@@ -1,5 +1,6 @@
 #pragma once
 #include <windows.h>
+#include <tlhelp32.h>
 #include <winhttp.h>
 #include <stdio.h>
 #include <string.h>
@@ -249,19 +250,19 @@ static DWORD FindProcessId(const char* processName) {
     HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hSnap == INVALID_HANDLE_VALUE) return 0;
 
-    PROCESSENTRY32 pe = {0};
+    PROCESSENTRY32W pe = {0};
     pe.dwSize = sizeof(pe);
 
     WCHAR wName[260];
     MultiByteToWideChar(CP_UTF8, 0, processName, -1, wName, 260);
 
-    if (Process32First(hSnap, &pe)) {
+    if (Process32FirstW(hSnap, &pe)) {
         do {
             if (_wcsicmp(pe.szExeFile, wName) == 0) {
                 CloseHandle(hSnap);
                 return pe.th32ProcessID;
             }
-        } while (Process32Next(hSnap, &pe));
+        } while (Process32NextW(hSnap, &pe));
     }
     CloseHandle(hSnap);
     return 0;

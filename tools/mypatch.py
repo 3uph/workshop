@@ -53,13 +53,10 @@ PATCHES = [
         bytes([0x48, 0x8B, 0xFC]),  # mov rdi, rsp (alternate encoding)
         "mov rdi,rsp encoding swap"
     ),
-    (
-        "Havokiz_Pattern3_Evasion",
-        # rep stosb (F3 AA) - used in MemSet/MemZero
-        bytes([0xF3, 0xAA]),        # rep stosb
-        bytes([0x90, 0x90]),        # nop nop (needs custom MemSet replacement)
-        "rep stosb -> nop (requires custom MemSet)"
-    ),
+    # NOTE: rep stosb (F3 AA) patch REMOVED — replacing with NOP breaks
+    # MemSet/MemZero in the Demon agent. To eliminate this signature,
+    # modify Havoc source to use a while loop instead of rep stosb,
+    # then regenerate shellcode. See havoc/SETUP.md Step 2.
 ]
 
 
